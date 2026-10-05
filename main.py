@@ -1,21 +1,10 @@
 import os
-import base64
-from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, HTTPException, Request
+import hashlib
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from cryptography.fernet import Fernet
 from supabase import create_client, Client
-
-# مفتاح التشفير الخاص بـ Proma
-SECRET_KEY = b'fL5Z5bgrVzXAgMrKXwR2rokpyD64D0h7TTRCkZDQUBM='
-cipher = Fernet(SECRET_KEY)
-
-# بيانات Supabase الخاصة بك
-SUPABASE_URL = "https://uszbqlcighavafvmrhfr.supabase.co"
-SUPABASE_KEY = "sb_publishable_ciTaxf6GVUJFPDckPWdJXg_1YtSM-bv"
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
@@ -27,43 +16,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uszbqlcighavafvmrhfr.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_ciTaxf6GVUJFPDckPWdJXg_1YtSM-bv")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 class TrialRequest(BaseModel):
-    device_id: str
+    serial_number: str
 
-def generate_trial_token(device_id: str) -> str:
-    expiry_time = datetime.now(timezone.utc) + timedelta(days=3)
-    expiry_timestamp = int(expiry_time.timestamp())
-    payload = f"TRIAL:{device_id.strip()}:{expiry_timestamp}"
-    token = cipher.encrypt(payload.encode())
-    return base64.urlsafe_b64encode(token).decode()
+def generate_code(serial: str) -> str:
+    # توليد كود تفعيل مشفر مقروء بناءً على السيريال
+    raw = f"{serial}_PROMA_TRIAL_SECRET"
+    digest = hashlib.sha256(raw.encode()).hexdigest().upper()
+    return f"PROMA-3D-{digest[:4]}-{digest[4:8]}"
 
-@app.post("/api/request-trial")
-async def request_trial(data: TrialRequest, request: Request):
-    device_id = data.device_id.strip()
-    client_ip = request.client.host if request.client else "Unknown"
+@app.post("/generate-trial")
+def generate_trial(req: TrialRequest):
+    serial = req.serial_number.strip().upper()
+    if not serial:
+        raise HTTPException(status_code=400, detail="السيريال مطلوب")
 
-    if not device_id:
-        raise HTTPException(status_code=400, detail="يرجى إدخال سيريال الجهاز الصحيح.")
+    # 1. البحث عن السيريال في قاعدة البيانات
+    response = supabase.table("trial_devices").select("*").eq("device_id", serial).execute()
+    existing = response.data
 
-    # فحص إذا كان الجهاز مسجلاً من قبل
-    existing = supabase.table("trial_devices").select("device_id").eq("device_id", device_id).execute()
-    
-    if len(existing.data) > 0:
+    if existing:
+        device = existing[0]
+        # حساب المتبقي من الـ 3 أيام
+        created_at = datetime.fromisoformat(device["created_at"].replace("Z", "+00:00"))
+        expires_at = created_at + timedelta(days=3)
+        now = datetime.now(created_at.tzinfo)
+
+        if now > expires_at:
+            return {
+                "success": False,
+                "message": "انتهت الفترة التجريبية (3 أيام) لهذا الجهاز مسبقاً."
+            }
+        
+        days_left = max(1, (expires_at - now).days + 1)
         return {
-            "success": False,
-            "message": "عفواً، لقد تم استخدام التجربة المجانية لهذا الجهاز من قبل."
+            "success": True,
+            "activation_code": device.get("activation_code", generate_code(serial)),
+            "days_left": days_left,
+            "message": f"تمت استعادة كود التفعيل المجاني. متبقي {days_left} أيام."
         }
 
-    # توليد الكود والتسجيل
-    trial_code = generate_trial_token(device_id)
-
-    supabase.table("trial_devices").insert({
-        "device_id": device_id,
-        "ip_address": client_ip
-    }).execute()
+    # 2. تسجيل جهاز جديد لمدة 3 أيام
+    act_code = generate_code(serial)
+    new_device = {
+        "device_id": serial,
+        "activation_code": act_code
+    }
+    supabase.table("trial_devices").insert(new_device).execute()
 
     return {
         "success": True,
-        "message": "تم إنشاء كود التجربة المجانية بنجاح!",
-        "trial_code": trial_code
+        "activation_code": act_code,
+        "days_left": 3,
+        "message": "تم إنشاء كود التفعيل المجاني بنجاح لمدة 3 أيام!"
     }
